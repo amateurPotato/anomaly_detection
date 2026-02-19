@@ -1,0 +1,4 @@
+# Exclude my personal docs from AI context
+docs/
+secrets/
+*.pdf
