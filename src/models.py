@@ -92,3 +92,6 @@ class TrackerConfig(BaseModel):
     payload_threshold_bytes: int = 10 * 1024 * 1024  # 10 MB
     micro_batch_seconds: float = 10.0
     max_queue_size: int = 10_000
+    stale_window_seconds: int = 300  # 5 minutes
+    circuit_breaker_threshold: int = 5   # consecutive failures before opening
+    circuit_breaker_cooldown_seconds: float = 60.0  # seconds to stay open

@@ -78,6 +78,10 @@ class AnomalyTracker:
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
 
+        # Circuit breaker state
+        self._consecutive_failures: int = 0
+        self._circuit_open_at: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -179,10 +183,11 @@ class AnomalyTracker:
     # ------------------------------------------------------------------
 
     async def _flush_loop(self) -> None:
-        """Background task: flush pending contexts every micro_batch_seconds."""
+        """Background task: flush pending contexts and evict stale windows every micro_batch_seconds."""
         while self._running:
             await asyncio.sleep(self._config.micro_batch_seconds)
             await self._flush_pending()
+            self._cleanup_stale_windows()
 
     async def _flush_pending(self) -> None:
         """
@@ -203,13 +208,57 @@ class AnomalyTracker:
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _cleanup_stale_windows(self) -> None:
+        """
+        Remove per-IP windows that have been idle for longer than stale_window_seconds.
+
+        An IP is considered stale when its most recent event (the last entry in its
+        deque) is older than ``now - config.stale_window_seconds``. Removing these
+        entries prevents unbounded memory growth in long-running deployments where
+        IPs are seen once and then disappear.
+
+        Called synchronously from ``_flush_loop`` after each batch flush.
+        """
+        cutoff = time.time() - self._config.stale_window_seconds
+        stale = [
+            ip for ip, window in self._windows.items()
+            if not window or window[-1][0] < cutoff
+        ]
+        for ip in stale:
+            del self._windows[ip]
+
+    def _is_circuit_open(self) -> bool:
+        """
+        Return True if the circuit breaker is currently open (LLM calls blocked).
+
+        If the cooldown period has elapsed since the circuit was opened, the breaker
+        resets to closed and returns False, allowing the next request through.
+        """
+        if self._circuit_open_at is None:
+            return False
+        elapsed = time.time() - self._circuit_open_at
+        if elapsed >= self._config.circuit_breaker_cooldown_seconds:
+            self._circuit_open_at = None
+            self._consecutive_failures = 0
+            print("[AnomalyTracker] Circuit breaker reset — resuming LLM analysis.")
+            return False
+        return True
+
     async def _analyze_and_emit(self, context: IPContext, batch_id: str) -> None:
         """
         Call analyze_with_llm, build an AnomalyReport, and emit via callback.
-        Exceptions are caught here so a single LLM failure cannot crash the engine.
+
+        Skips the LLM call silently when the circuit breaker is open.
+        On success resets the consecutive-failure counter.
+        On failure increments it and opens the circuit once the threshold is reached.
+        Exceptions are always caught so a single failure cannot crash the engine.
         """
+        if self._is_circuit_open():
+            return
+
         try:
             analysis = await self.analyze_with_llm(context)
+            self._consecutive_failures = 0
             report = AnomalyReport(
                 context=context,
                 analysis=analysis,
@@ -218,7 +267,19 @@ class AnomalyTracker:
             if self._report_callback:
                 await self._report_callback(report)
         except Exception as exc:
+            self._consecutive_failures += 1
             print(f"[AnomalyTracker] LLM analysis failed for {context.source_ip}: {exc}")
+            if (
+                self._consecutive_failures >= self._config.circuit_breaker_threshold
+                and self._circuit_open_at is None
+            ):
+                self._circuit_open_at = time.time()
+                print(
+                    f"[AnomalyTracker] CRITICAL: Circuit breaker opened after "
+                    f"{self._consecutive_failures} consecutive LLM failures. "
+                    f"LLM analysis suspended for "
+                    f"{self._config.circuit_breaker_cooldown_seconds:.0f}s."
+                )
 
     # ------------------------------------------------------------------
     # LLM analysis (neural layer)

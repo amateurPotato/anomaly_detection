@@ -153,10 +153,21 @@ class TestTrackerConfig:
         assert cfg.window_seconds == 60
         assert cfg.unique_endpoint_threshold == 10
         assert cfg.micro_batch_seconds == 10.0
+        assert cfg.stale_window_seconds == 300
+        assert cfg.circuit_breaker_threshold == 5
+        assert cfg.circuit_breaker_cooldown_seconds == 60.0
 
     def test_override(self):
-        cfg = TrackerConfig(unique_endpoint_threshold=5)
+        cfg = TrackerConfig(
+            unique_endpoint_threshold=5,
+            stale_window_seconds=60,
+            circuit_breaker_threshold=3,
+            circuit_breaker_cooldown_seconds=30.0,
+        )
         assert cfg.unique_endpoint_threshold == 5
+        assert cfg.stale_window_seconds == 60
+        assert cfg.circuit_breaker_threshold == 3
+        assert cfg.circuit_breaker_cooldown_seconds == 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +515,246 @@ class TestLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# 8. run_simulation
+# 8. Circuit breaker
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCircuitBreaker:
+    def _failing_client(self) -> AsyncMock:
+        client = AsyncMock()
+        client.messages.create = AsyncMock(side_effect=Exception("LLM unavailable"))
+        return client
+
+    # --- _is_circuit_open unit tests (synchronous) ---
+
+    async def test_circuit_closed_by_default(self, tracker: AnomalyTracker):
+        assert tracker._is_circuit_open() is False
+
+    async def test_circuit_open_after_threshold_failures(self, config: TrackerConfig):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        tracker._consecutive_failures = config.circuit_breaker_threshold
+        tracker._circuit_open_at = time.time()
+        assert tracker._is_circuit_open() is True
+
+    async def test_circuit_resets_after_cooldown(self, config: TrackerConfig):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        # Place the open timestamp far enough in the past that cooldown has expired
+        tracker._circuit_open_at = time.time() - (config.circuit_breaker_cooldown_seconds + 1)
+        tracker._consecutive_failures = config.circuit_breaker_threshold
+
+        assert tracker._is_circuit_open() is False   # triggers reset
+        assert tracker._circuit_open_at is None
+        assert tracker._consecutive_failures == 0
+
+    async def test_circuit_stays_open_within_cooldown(self, config: TrackerConfig):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        tracker._circuit_open_at = time.time() - 5   # only 5s ago, cooldown=60s
+        tracker._consecutive_failures = config.circuit_breaker_threshold
+        assert tracker._is_circuit_open() is True
+
+    # --- _analyze_and_emit integration ---
+
+    async def test_failure_counter_increments(self, config: TrackerConfig, sample_context: IPContext):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        await tracker._analyze_and_emit(sample_context, "batch-1")
+        assert tracker._consecutive_failures == 1
+
+    async def test_success_resets_failure_counter(
+        self, config: TrackerConfig, mock_client: AsyncMock, sample_context: IPContext
+    ):
+        tracker = AnomalyTracker(anthropic_client=mock_client, config=config)
+        tracker._consecutive_failures = 3   # pre-seed with some failures
+
+        await tracker._analyze_and_emit(sample_context, "batch-1")
+
+        assert tracker._consecutive_failures == 0
+
+    async def test_circuit_opens_at_threshold(
+        self, config: TrackerConfig, sample_context: IPContext
+    ):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        for i in range(config.circuit_breaker_threshold):
+            await tracker._analyze_and_emit(sample_context, f"batch-{i}")
+
+        assert tracker._circuit_open_at is not None
+        assert tracker._consecutive_failures == config.circuit_breaker_threshold
+
+    async def test_circuit_does_not_open_below_threshold(
+        self, config: TrackerConfig, sample_context: IPContext
+    ):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        for i in range(config.circuit_breaker_threshold - 1):
+            await tracker._analyze_and_emit(sample_context, f"batch-{i}")
+
+        assert tracker._circuit_open_at is None
+
+    async def test_open_circuit_skips_llm_call(
+        self, config: TrackerConfig, sample_context: IPContext
+    ):
+        mock = self._failing_client()
+        tracker = AnomalyTracker(anthropic_client=mock, config=config)
+        # Force circuit open
+        tracker._circuit_open_at = time.time()
+        tracker._consecutive_failures = config.circuit_breaker_threshold
+
+        await tracker._analyze_and_emit(sample_context, "batch-skip")
+
+        mock.messages.create.assert_not_called()
+
+    async def test_open_circuit_does_not_increment_counter(
+        self, config: TrackerConfig, sample_context: IPContext
+    ):
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        tracker._circuit_open_at = time.time()
+        tracker._consecutive_failures = config.circuit_breaker_threshold
+
+        await tracker._analyze_and_emit(sample_context, "batch-skip")
+
+        assert tracker._consecutive_failures == config.circuit_breaker_threshold
+
+    async def test_circuit_opens_only_once_per_trip(
+        self, config: TrackerConfig, sample_context: IPContext
+    ):
+        """A second batch of failures after the circuit is open must not reset the open timestamp."""
+        tracker = AnomalyTracker(anthropic_client=self._failing_client(), config=config)
+        # Open the circuit
+        for i in range(config.circuit_breaker_threshold):
+            await tracker._analyze_and_emit(sample_context, f"batch-{i}")
+
+        first_open_at = tracker._circuit_open_at
+        assert first_open_at is not None
+
+        # With circuit open the call is skipped — open timestamp must be unchanged
+        await tracker._analyze_and_emit(sample_context, "batch-extra")
+        assert tracker._circuit_open_at == first_open_at
+
+    async def test_symbolic_rules_still_fire_while_circuit_open(
+        self, config: TrackerConfig, sample_context: IPContext
+    ):
+        """Events are still ingested and rules still evaluated when the circuit is open."""
+        tracker = AnomalyTracker(
+            anthropic_client=self._failing_client(), config=config
+        )
+        tracker._circuit_open_at = time.time()
+        tracker._consecutive_failures = config.circuit_breaker_threshold
+
+        now = time.time()
+        for i in range(4):   # 4 unique endpoints > threshold of 3
+            await tracker.ingest_event(
+                Event(source_ip="9.9.9.9", endpoint=f"/ep/{i}",
+                      payload_size=50, timestamp=now + i)
+            )
+
+        # Rule fired and populated pending_contexts despite open circuit
+        async with tracker._batch_lock:
+            pending = [c for c in tracker._pending_contexts if c.source_ip == "9.9.9.9"]
+        assert len(pending) == 1
+
+    async def test_circuit_resets_and_resumes_after_cooldown(
+        self, config: TrackerConfig, mock_client: AsyncMock, sample_context: IPContext
+    ):
+        """After cooldown expires the circuit closes and the next call succeeds."""
+        received: List[AnomalyReport] = []
+
+        async def on_report(r: AnomalyReport) -> None:
+            received.append(r)
+
+        # cfg = TrackerConfig(
+        #     **config.model_dump(),
+        #     circuit_breaker_cooldown_seconds=0.0,   # cooldown already expired immediately
+        # )
+        cfg = config.model_copy(update={"circuit_breaker_cooldown_seconds": 0.0})
+        tracker = AnomalyTracker(
+            anthropic_client=mock_client, config=cfg, report_callback=on_report
+        )
+        # Simulate circuit that was opened just long enough ago for cooldown to have passed
+        tracker._circuit_open_at = time.time() - 1
+        tracker._consecutive_failures = cfg.circuit_breaker_threshold
+
+        await tracker._analyze_and_emit(sample_context, "batch-resume")
+
+        assert len(received) == 1
+        assert tracker._circuit_open_at is None
+        assert tracker._consecutive_failures == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. _cleanup_stale_windows
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupStaleWindows:
+    def test_stale_ip_removed(self, config: TrackerConfig, mock_client: AsyncMock):
+        """IP whose newest event is older than stale_window_seconds is removed."""
+        tracker = AnomalyTracker(anthropic_client=mock_client, config=config)
+        old_ts = time.time() - (config.stale_window_seconds + 10)
+        tracker._windows["1.2.3.4"].append((old_ts, "/old", 100))
+
+        tracker._cleanup_stale_windows()
+
+        assert "1.2.3.4" not in tracker._windows
+
+    def test_active_ip_retained(self, config: TrackerConfig, mock_client: AsyncMock):
+        """IP whose newest event is within the stale threshold is kept."""
+        tracker = AnomalyTracker(anthropic_client=mock_client, config=config)
+        recent_ts = time.time() - 10  # 10 seconds ago — well within 5 minutes
+        tracker._windows["5.6.7.8"].append((recent_ts, "/recent", 100))
+
+        tracker._cleanup_stale_windows()
+
+        assert "5.6.7.8" in tracker._windows
+
+    def test_empty_window_removed(self, config: TrackerConfig, mock_client: AsyncMock):
+        """An empty deque (defensive case) is treated as stale and removed."""
+        tracker = AnomalyTracker(anthropic_client=mock_client, config=config)
+        # Access the defaultdict key directly to create an empty deque
+        _ = tracker._windows["9.9.9.9"]
+
+        tracker._cleanup_stale_windows()
+
+        assert "9.9.9.9" not in tracker._windows
+
+    def test_mixed_ips_only_stale_removed(self, config: TrackerConfig, mock_client: AsyncMock):
+        """Only stale IPs are evicted; active IPs are untouched."""
+        tracker = AnomalyTracker(anthropic_client=mock_client, config=config)
+        now = time.time()
+        tracker._windows["stale.ip"].append((now - (config.stale_window_seconds + 1), "/x", 10))
+        tracker._windows["active.ip"].append((now - 5, "/y", 10))
+
+        tracker._cleanup_stale_windows()
+
+        assert "stale.ip" not in tracker._windows
+        assert "active.ip" in tracker._windows
+
+
+
+# ---------------------------------------------------------------------------
+# 11. _cleanup_stale_windows — flush-loop integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCleanupStaleWindowsIntegration:
+    async def test_cleanup_called_by_flush_loop(self, mock_client: AsyncMock):
+        """Stale windows are removed after the background flush loop fires."""
+        cfg = TrackerConfig(
+            micro_batch_seconds=0.1,
+            stale_window_seconds=0,   # every window is immediately stale
+        )
+        tracker = AnomalyTracker(anthropic_client=mock_client, config=cfg)
+        old_ts = time.time() - 1
+        tracker._windows["2.2.2.2"].append((old_ts, "/gone", 10))
+
+        await tracker.start()
+        await asyncio.sleep(0.25)   # let at least two flush cycles run
+        await tracker.stop()
+
+        assert "2.2.2.2" not in tracker._windows
+
+
+# ---------------------------------------------------------------------------
+# 12. run_simulation
 # ---------------------------------------------------------------------------
 
 
@@ -523,3 +773,4 @@ class TestRunSimulation:
     async def test_empty_event_list(self, tracker: AnomalyTracker):
         await run_simulation(tracker, [], inter_event_delay=0.0)
         assert tracker._windows == {}
+        # There is no TestCircuitBreaker class or related tests in this file, so nothing to convert.

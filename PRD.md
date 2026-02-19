@@ -94,6 +94,7 @@ forced tool-use — not free text — to guarantee machine-parseable output.
 ### Reasoning priority
 
 The LLM prompt instructs Claude to prioritise **Lateral Movement** patterns:
+
 - Systematic scanning of internal endpoints
 - Credential-access staging
 - East-west (intra-network) traversal
