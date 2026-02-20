@@ -90,6 +90,11 @@ It enables:
 - Applying formal logic over learned representations  
 - Improving consistency and explainability  
 
+#### Note: For the project Symbolic-to-Neural pipeline is used, and not Neural-to-Symbolic. The sequence is designed to use the "cheap" symbolic logic as a high-pass filter before using the "expensive" neural logic for the final judgment.
+
+$$Raw\ Data \rightarrow Symbolic\ Rules \rightarrow Structured\ Context \rightarrow Neural\ Analysis \rightarrow Final\ Report$$
+
+
 ---
 
 ## Core Approaches
