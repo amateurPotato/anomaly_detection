@@ -114,16 +114,41 @@ class LLMAnalyser:
         )
 
 
+# JSON schema passed to Ollama's structured-output feature (requires Ollama ≥ 0.5.0).
+# Using constrained decoding means the model CANNOT produce prose or markdown —
+# the response is always a JSON object that exactly matches this shape.
+_LOCAL_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "threat_score": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+        },
+        "observations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+        "suggested_mitigation": {
+            "type": "string",
+        },
+    },
+    "required": ["threat_score", "observations", "suggested_mitigation"],
+    "additionalProperties": False,
+}
+
+
 class LocalLLMAnalyser:
     """
-    Neural layer: sends IPContext to a local Ollama LLM and returns a validated LLMAnalysis.
+    Neural layer: sends IPContext to a local Ollama model and returns a validated LLMAnalysis.
 
-    Uses Ollama's JSON mode to get structured output without tool-use.
-    The prompt explicitly describes the required schema so the model produces
-    a JSON object that Pydantic can validate into LLMAnalysis.
+    Uses Ollama's structured-output format (JSON schema constrained decoding, Ollama ≥ 0.5.0)
+    so the model is physically prevented from producing anything other than the expected JSON.
+    Pydantic validation still runs as a final correctness gate.
     """
 
-    DEFAULT_MODEL = "llama3.2"
+    DEFAULT_MODEL = "llama3"
 
     def __init__(
         self,
@@ -142,9 +167,9 @@ class LocalLLMAnalyser:
         httpx.HTTPError
             If the Ollama server is unreachable or returns a non-2xx status.
         json.JSONDecodeError
-            If the model response is not valid JSON.
+            If the model response is not valid JSON (should not happen with schema mode).
         pydantic.ValidationError
-            If the JSON does not match the LLMAnalysis schema.
+            If the JSON does not satisfy the LLMAnalysis field constraints.
         """
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
@@ -152,7 +177,7 @@ class LocalLLMAnalyser:
                 json={
                     "model": self._model,
                     "messages": [{"role": "user", "content": self.build_prompt(context)}],
-                    "format": "json",
+                    "format": _LOCAL_OUTPUT_SCHEMA,  # constrained decoding — no chatty prose
                     "stream": False,
                 },
             )
@@ -160,30 +185,31 @@ class LocalLLMAnalyser:
 
         data = response.json()
         content = data["message"]["content"]
-        return LLMAnalysis.model_validate(json.loads(content))
+        parsed = json.loads(content)
+        # llama3 ignores schema min/max constraints — clamp to valid range
+        if "threat_score" in parsed:
+            parsed["threat_score"] = max(0.0, min(1.0, float(parsed["threat_score"])))
+        return LLMAnalysis.model_validate(parsed)
 
     def build_prompt(self, context: IPContext) -> str:
-        """Prompt that instructs the local model to return a JSON matching LLMAnalysis."""
+        """
+        Focused analysis prompt. Format instructions are omitted — the JSON schema
+        passed to Ollama enforces structure, so the prompt concentrates on the task.
+        """
         endpoint_list = context.unique_endpoints[:20]
         truncation_note = (
             "...(truncated)" if len(context.unique_endpoints) > 20 else ""
         )
         return (
-            f"Analyze this suspicious network activity and respond ONLY with a JSON object "
-            f"matching this exact schema (no extra text or markdown):\n"
-            f'{{"threat_score": <float 0.0-1.0>, '
-            f'"observations": ["<string>", ...], '
-            f'"suggested_mitigation": "<string>"}}\n\n'
-            f"Network activity:\n"
-            f"Source IP: {context.source_ip}\n"
-            f"Triggered rules: {', '.join(context.triggered_rules)}\n"
-            f"Unique endpoints accessed: {len(context.unique_endpoints)}\n"
-            f"Endpoints: {', '.join(endpoint_list)}{truncation_note}\n"
-            f"Total payload transferred: {context.total_payload_size:,} bytes\n"
-            f"Events in window: {context.event_count}\n"
-            f"Window duration: {context.window_end - context.window_start:.1f}s\n\n"
-            f"Determine if this is data exfiltration, reconnaissance, or a false positive. "
-            f"Prioritize identifying Lateral Movement patterns "
-            f"(e.g. systematic scanning of internal endpoints, credential-access staging, "
-            f"east-west traversal). Return ONLY the JSON object."
+            f"You are a network security analyst. Classify the suspicious activity below "
+            f"as data exfiltration, reconnaissance, or false positive.\n\n"
+            f"Source IP         : {context.source_ip}\n"
+            f"Triggered rules   : {', '.join(context.triggered_rules)}\n"
+            f"Unique endpoints  : {len(context.unique_endpoints)}"
+            f" ({', '.join(endpoint_list)}{truncation_note})\n"
+            f"Total payload     : {context.total_payload_size:,} bytes\n"
+            f"Events in window  : {context.event_count}\n"
+            f"Window duration   : {context.window_end - context.window_start:.1f} s\n\n"
+            f"Prioritize Lateral Movement indicators: systematic endpoint scanning, "
+            f"credential-access staging, east-west traversal."
         )

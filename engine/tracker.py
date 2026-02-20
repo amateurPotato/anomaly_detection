@@ -51,6 +51,7 @@ class AnomalyTracker:
 
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
+        self._active_llm_tasks: set[asyncio.Task] = set()
 
         # Composed components — each independently testable
         self._rules = RuleEngine(
@@ -85,7 +86,7 @@ class AnomalyTracker:
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self) -> None:
-        """Cancel the flush loop and drain any remaining pending contexts."""
+        """Cancel the flush loop, wait for any in-progress LLM tasks, then drain remaining."""
         self._running = False
         if self._flush_task:
             self._flush_task.cancel()
@@ -93,6 +94,9 @@ class AnomalyTracker:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
+        # LLM tasks are shielded from flush-loop cancellation — wait for them here.
+        if self._active_llm_tasks:
+            await asyncio.gather(*list(self._active_llm_tasks), return_exceptions=True)
         await self._flush_pending()
 
     # ------------------------------------------------------------------
@@ -154,7 +158,15 @@ class AnomalyTracker:
             asyncio.create_task(self._analyze_and_emit(ctx, batch_id))
             for ctx in batch
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            self._active_llm_tasks.add(task)
+            task.add_done_callback(self._active_llm_tasks.discard)
+        try:
+            # Shield protects tasks from cancellation when the flush loop is cancelled.
+            # stop() then waits for any surviving tasks via _active_llm_tasks.
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        except asyncio.CancelledError:
+            pass  # tasks continue; stop() will await them
 
     def _cleanup_stale_windows(self) -> None:
         """

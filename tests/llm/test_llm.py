@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
 
 from anomaly_detection.core.models import IPContext
-from anomaly_detection.llm import ANALYSIS_TOOL_SCHEMA, LLMAnalyser
+from anomaly_detection.llm import ANALYSIS_TOOL_SCHEMA, LLMAnalyser, LocalLLMAnalyser
 
 
 # ---------------------------------------------------------------------------
@@ -134,3 +135,139 @@ class TestBuildPrompt:
     def test_contains_lateral_movement_tip(self, sample_context: IPContext):
         analyser, _ = make_analyser()
         assert "Lateral Movement" in analyser.build_prompt(sample_context)
+
+
+# ---------------------------------------------------------------------------
+# LocalLLMAnalyser helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_local_http_mock(response_body: dict) -> MagicMock:
+    """Return a mock httpx.AsyncClient whose .post() returns response_body as JSON."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = response_body
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_response)
+    return mock_client
+
+
+# ---------------------------------------------------------------------------
+# LocalLLMAnalyser tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLocalLLMAnalyser:
+    async def test_returns_valid_analysis(self, sample_context: IPContext):
+        body = {
+            "message": {
+                "content": json.dumps({
+                    "threat_score": 0.9,
+                    "observations": ["20 unique endpoints in 5s"],
+                    "suggested_mitigation": "Block IP",
+                })
+            }
+        }
+        with patch("anomaly_detection.llm.analyser.httpx.AsyncClient", return_value=_make_local_http_mock(body)):
+            result = await LocalLLMAnalyser().analyse(sample_context)
+        assert result.threat_score == 0.9
+        assert result.observations == ["20 unique endpoints in 5s"]
+
+    async def test_clamps_threat_score_above_one(self, sample_context: IPContext):
+        """llama3 may return values like 3 — clamp to 1.0 instead of failing validation."""
+        body = {
+            "message": {
+                "content": json.dumps({
+                    "threat_score": 3,
+                    "observations": ["Suspicious"],
+                    "suggested_mitigation": "Block",
+                })
+            }
+        }
+        with patch("anomaly_detection.llm.analyser.httpx.AsyncClient", return_value=_make_local_http_mock(body)):
+            result = await LocalLLMAnalyser().analyse(sample_context)
+        assert result.threat_score == 1.0
+
+    async def test_clamps_threat_score_below_zero(self, sample_context: IPContext):
+        body = {
+            "message": {
+                "content": json.dumps({
+                    "threat_score": -0.5,
+                    "observations": ["Low risk"],
+                    "suggested_mitigation": "Monitor",
+                })
+            }
+        }
+        with patch("anomaly_detection.llm.analyser.httpx.AsyncClient", return_value=_make_local_http_mock(body)):
+            result = await LocalLLMAnalyser().analyse(sample_context)
+        assert result.threat_score == 0.0
+
+    async def test_posts_to_correct_url_and_model(self, sample_context: IPContext):
+        body = {
+            "message": {
+                "content": json.dumps({
+                    "threat_score": 0.5,
+                    "observations": ["ok"],
+                    "suggested_mitigation": "none",
+                })
+            }
+        }
+        mock_http = _make_local_http_mock(body)
+        with patch("anomaly_detection.llm.analyser.httpx.AsyncClient", return_value=mock_http):
+            await LocalLLMAnalyser(base_url="http://localhost:11434", model="llama3").analyse(sample_context)
+        call_kwargs = mock_http.post.call_args
+        assert call_kwargs[0][0] == "http://localhost:11434/api/chat"
+        payload = call_kwargs[1]["json"]
+        assert payload["model"] == "llama3"
+        assert payload["stream"] is False
+
+    async def test_raises_on_missing_observations(self, sample_context: IPContext):
+        """Pydantic still rejects structurally invalid output (e.g. empty observations)."""
+        body = {
+            "message": {
+                "content": json.dumps({
+                    "threat_score": 0.5,
+                    "observations": [],          # min_length=1
+                    "suggested_mitigation": "x",
+                })
+            }
+        }
+        with patch("anomaly_detection.llm.analyser.httpx.AsyncClient", return_value=_make_local_http_mock(body)):
+            with pytest.raises(ValidationError):
+                await LocalLLMAnalyser().analyse(sample_context)
+
+
+class TestLocalBuildPrompt:
+    def test_contains_ip_and_rules(self, sample_context: IPContext):
+        prompt = LocalLLMAnalyser().build_prompt(sample_context)
+        assert sample_context.source_ip in prompt
+        assert "UNIQUE_ENDPOINT_THRESHOLD" in prompt
+        assert f"{sample_context.total_payload_size:,}" in prompt
+
+    def test_truncates_endpoint_list_over_20(self):
+        ctx = IPContext(
+            source_ip="1.2.3.4",
+            unique_endpoints=[f"/ep/{i}" for i in range(25)],
+            total_payload_size=5000,
+            event_count=25,
+            window_start=time.time() - 30,
+            window_end=time.time(),
+            triggered_rules=["UNIQUE_ENDPOINT_THRESHOLD"],
+        )
+        assert "truncated" in LocalLLMAnalyser().build_prompt(ctx)
+
+    def test_no_truncation_under_20(self):
+        ctx = IPContext(
+            source_ip="1.2.3.4",
+            unique_endpoints=[f"/ep/{i}" for i in range(10)],
+            total_payload_size=5000,
+            event_count=10,
+            window_start=time.time() - 30,
+            window_end=time.time(),
+            triggered_rules=["UNIQUE_ENDPOINT_THRESHOLD"],
+        )
+        assert "truncated" not in LocalLLMAnalyser().build_prompt(ctx)

@@ -44,7 +44,7 @@ in editable mode. You only need to run this once (or after adding new dependenci
 ### 2 — Pull the local model
 
 ```bash
-make check-ollama          # verifies Ollama is running and pulls llama3.2
+make check-ollama          # verifies Ollama is running and pulls llama3
 ```
 
 Ollama must be running before this step (`ollama serve` or the desktop app). To use a different
@@ -107,7 +107,7 @@ All tests are fully offline — LLM calls are mocked, no Ollama or API key neede
 | `circuit_breaker_threshold` | `5` | Consecutive LLM failures before opening |
 | `circuit_breaker_cooldown_seconds` | `60.0` | Seconds the circuit stays open |
 | `use_cloud_llm` | `False` | `False` = local Ollama, `True` = Anthropic Claude |
-| `ollama_model` | `"llama3.2"` | Local model name |
+| `ollama_model` | `"llama3"` | Local model name |
 | `ollama_base_url` | `"http://localhost:11434"` | Ollama server URL |
 
 ---
@@ -186,5 +186,5 @@ anomaly_detection/
 | --- | --- | --- |
 | `USE_CLOUD_LLM` | `false` | Set to `true` to use Anthropic Claude in the demo |
 | `ANTHROPIC_API_KEY` | — | Required when `USE_CLOUD_LLM=true` |
-| `OLLAMA_MODEL` | `llama3.2` | Local model name (demo only) |
+| `OLLAMA_MODEL` | `llama3` | Local model name (demo only) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL (demo only) |

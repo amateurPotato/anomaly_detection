@@ -98,5 +98,5 @@ class TrackerConfig(BaseModel):
 
     # Hybrid LLM: False = local Ollama (default), True = cloud Anthropic
     use_cloud_llm: bool = False
-    ollama_model: str = "llama3.2"
+    ollama_model: str = "llama3"
     ollama_base_url: str = "http://localhost:11434"

@@ -42,7 +42,7 @@ async def main() -> None:
         payload_threshold_bytes=10 * 1024 * 1024,
         micro_batch_seconds=10.0,
         use_cloud_llm=use_cloud,
-        ollama_model=os.environ.get("OLLAMA_MODEL", "llama3.2"),
+        ollama_model=os.environ.get("OLLAMA_MODEL", "llama3"),
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
     )
 
