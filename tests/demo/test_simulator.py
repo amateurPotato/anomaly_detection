@@ -11,7 +11,7 @@ import pytest
 from anomaly_detection.core.models import Event, TrackerConfig
 from anomaly_detection.demo import run_simulation
 from anomaly_detection.engine import AnomalyTracker
-from tests.conftest import make_mock_client
+from ..conftest import make_mock_client
 
 
 @pytest.fixture

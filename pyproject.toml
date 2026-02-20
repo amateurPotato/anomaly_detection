@@ -23,16 +23,23 @@ anomaly-demo = "anomaly_detection.demo.simulator:run_main"
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["anomaly_detection*"]
+[tool.setuptools]
+package-dir = { "anomaly_detection" = "." }
+packages = [
+    "anomaly_detection",
+    "anomaly_detection.core",
+    "anomaly_detection.engine",
+    "anomaly_detection.llm",
+    "anomaly_detection.demo",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
 [tool.coverage.run]
 branch = true
-source = ["anomaly_detection"]
+source = ["."]
+omit = ["tests/*", "*.egg-info/*", ".venv/*"]
 
 [tool.coverage.report]
 fail_under = 100
