@@ -39,6 +39,12 @@ Event Stream (simulated asyncio loop)
    AnomalyReport  -->  report_callback
 ```
 
+- Raw Data (Event): Individual log entries enter through ingest_event.
+- Symbolic Reasoning (_evaluate_rules): This is the first gate. It uses hard-coded thresholds (unique endpoints, payload size). If no rules fire, the process stops here.
+- Structured Representation (IPContext): If a rule fires, the raw window of data is distilled into a structured object containing only the relevant metadata.
+- Neural Network (analyze_with_llm): The structured context is sent to Claude. The LLM performs the high-level reasoning (detecting "Lateral Movement" or "Exfiltration").
+- Final Output (AnomalyReport): The final output is produced, combining the symbolic triggers with the neural threat score and mitigation steps.
+  
 ---
 
 ## 3. Key Design Decisions
