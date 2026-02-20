@@ -30,3 +30,11 @@ htmlcov/
 # IDE / tools (optional)
 .mypy_cache/
 .ruff_cache/
+
+# Cursor / VS Code
+.vscode/
+.cursor/
+
+# Local LLM weights (if downloaded locally)
+*.gguf
+models/
