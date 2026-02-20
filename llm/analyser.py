@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+
 import anthropic
+import httpx
 
 from ..core.models import IPContext, LLMAnalysis
 
@@ -108,4 +111,79 @@ class LLMAnalyser:
             f"Reasoning tip: Prioritize identifying Lateral Movement patterns "
             f"(e.g. systematic scanning of internal endpoints, credential-access staging, "
             f"east-west traversal). These are high-priority threats for this architecture."
+        )
+
+
+class LocalLLMAnalyser:
+    """
+    Neural layer: sends IPContext to a local Ollama LLM and returns a validated LLMAnalysis.
+
+    Uses Ollama's JSON mode to get structured output without tool-use.
+    The prompt explicitly describes the required schema so the model produces
+    a JSON object that Pydantic can validate into LLMAnalysis.
+    """
+
+    DEFAULT_MODEL = "llama3.2"
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = DEFAULT_MODEL,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+
+    async def analyse(self, context: IPContext) -> LLMAnalysis:
+        """
+        Send IPContext to the local Ollama model and return a validated LLMAnalysis.
+
+        Raises
+        ------
+        httpx.HTTPError
+            If the Ollama server is unreachable or returns a non-2xx status.
+        json.JSONDecodeError
+            If the model response is not valid JSON.
+        pydantic.ValidationError
+            If the JSON does not match the LLMAnalysis schema.
+        """
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{self._base_url}/api/chat",
+                json={
+                    "model": self._model,
+                    "messages": [{"role": "user", "content": self.build_prompt(context)}],
+                    "format": "json",
+                    "stream": False,
+                },
+            )
+            response.raise_for_status()
+
+        data = response.json()
+        content = data["message"]["content"]
+        return LLMAnalysis.model_validate(json.loads(content))
+
+    def build_prompt(self, context: IPContext) -> str:
+        """Prompt that instructs the local model to return a JSON matching LLMAnalysis."""
+        endpoint_list = context.unique_endpoints[:20]
+        truncation_note = (
+            "...(truncated)" if len(context.unique_endpoints) > 20 else ""
+        )
+        return (
+            f"Analyze this suspicious network activity and respond ONLY with a JSON object "
+            f"matching this exact schema (no extra text or markdown):\n"
+            f'{{"threat_score": <float 0.0-1.0>, '
+            f'"observations": ["<string>", ...], '
+            f'"suggested_mitigation": "<string>"}}\n\n'
+            f"Network activity:\n"
+            f"Source IP: {context.source_ip}\n"
+            f"Triggered rules: {', '.join(context.triggered_rules)}\n"
+            f"Unique endpoints accessed: {len(context.unique_endpoints)}\n"
+            f"Endpoints: {', '.join(endpoint_list)}{truncation_note}\n"
+            f"Total payload transferred: {context.total_payload_size:,} bytes\n"
+            f"Events in window: {context.event_count}\n"
+            f"Window duration: {context.window_end - context.window_start:.1f}s\n\n"
+            f"Determine if this is data exfiltration, reconnaissance, or a false positive. "
+            f"Prioritize identifying Lateral Movement patterns "
+            f"(e.g. systematic scanning of internal endpoints, credential-access staging, "
+            f"east-west traversal). Return ONLY the JSON object."
         )

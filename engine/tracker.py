@@ -10,7 +10,7 @@ import anthropic
 
 from ..core.models import AnomalyReport, Event, IPContext, TrackerConfig
 from ..core.rules import RuleEngine
-from ..llm import LLMAnalyser
+from ..llm import LLMAnalyser, LocalLLMAnalyser
 from .circuit_breaker import CircuitBreaker
 
 
@@ -27,13 +27,18 @@ class AnomalyTracker:
     4. Every ``config.micro_batch_seconds``, flush the buffer via LLMAnalyser (guarded by
        CircuitBreaker) and evict stale windows.
     5. Emit AnomalyReport objects via an optional async callback.
+
+    Hybrid LLM
+    ----------
+    When ``config.use_cloud_llm=False`` (default) the local Ollama model is used.
+    Set ``config.use_cloud_llm=True`` and pass an ``anthropic_client`` to use Claude.
     """
 
     def __init__(
         self,
-        anthropic_client: anthropic.AsyncAnthropic,
         config: TrackerConfig = TrackerConfig(),
         report_callback: Optional[Callable[[AnomalyReport], Awaitable[None]]] = None,
+        anthropic_client: Optional[anthropic.AsyncAnthropic] = None,
     ) -> None:
         self._config = config
         self._report_callback = report_callback
@@ -56,7 +61,19 @@ class AnomalyTracker:
             threshold=config.circuit_breaker_threshold,
             cooldown_seconds=config.circuit_breaker_cooldown_seconds,
         )
-        self._llm = LLMAnalyser(client=anthropic_client)
+
+        # Select LLM backend based on config flag
+        if config.use_cloud_llm:
+            if anthropic_client is None:
+                raise ValueError(
+                    "anthropic_client is required when use_cloud_llm=True"
+                )
+            self._llm: LLMAnalyser | LocalLLMAnalyser = LLMAnalyser(client=anthropic_client)
+        else:
+            self._llm = LocalLLMAnalyser(
+                base_url=config.ollama_base_url,
+                model=config.ollama_model,
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle

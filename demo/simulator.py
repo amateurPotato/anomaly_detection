@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import List
+from typing import List, Optional
 
 import anthropic
 
@@ -26,15 +26,33 @@ async def run_simulation(
 
 
 async def main() -> None:
-    """End-to-end demo. Requires ANTHROPIC_API_KEY in the environment."""
+    """
+    End-to-end demo.
+
+    LLM backend selection (via TrackerConfig.use_cloud_llm):
+      - use_cloud_llm=False (default): uses local Ollama — no API key needed.
+      - use_cloud_llm=True:            uses Claude cloud — ANTHROPIC_API_KEY required.
+    """
+    # Set use_cloud_llm=True to route to Anthropic Claude instead of local Ollama.
+    use_cloud = os.environ.get("USE_CLOUD_LLM", "false").lower() == "true"
+
     config = TrackerConfig(
         window_seconds=60,
         unique_endpoint_threshold=10,
         payload_threshold_bytes=10 * 1024 * 1024,
         micro_batch_seconds=10.0,
+        use_cloud_llm=use_cloud,
+        ollama_model=os.environ.get("OLLAMA_MODEL", "llama3.2"),
+        ollama_base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
     )
 
-    client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    anthropic_client: Optional[anthropic.AsyncAnthropic] = None
+    if use_cloud:
+        anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    backend = "Claude (cloud)" if use_cloud else f"Ollama/{config.ollama_model} (local)"
+    print(f"[Demo] LLM backend: {backend}")
+
     reports: List[AnomalyReport] = []
 
     async def on_report(report: AnomalyReport) -> None:
@@ -49,9 +67,9 @@ async def main() -> None:
             print(f"  - {obs}")
 
     tracker = AnomalyTracker(
-        anthropic_client=client,
         config=config,
         report_callback=on_report,
+        anthropic_client=anthropic_client,
     )
 
     now = time.time()

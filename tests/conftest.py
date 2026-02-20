@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from anomaly_detection.core.models import IPContext, TrackerConfig
+from anomaly_detection.core.models import IPContext, LLMAnalysis, TrackerConfig
 
 
 def make_mock_client(
@@ -37,6 +37,33 @@ def make_mock_client(
     client = AsyncMock()
     client.messages.create = AsyncMock(return_value=response)
     return client
+
+
+def make_mock_local_analyser(
+    threat_score: float = 0.85,
+    observations: List[str] | None = None,
+    suggested_mitigation: str = "Block IP at firewall and alert SOC team",
+) -> AsyncMock:
+    """Return a mock LocalLLMAnalyser whose analyse() returns a valid LLMAnalysis."""
+    if observations is None:
+        observations = ["Accessed 11 unique endpoints in 60s", "High payload volume"]
+
+    mock = AsyncMock()
+    mock.analyse = AsyncMock(
+        return_value=LLMAnalysis(
+            threat_score=threat_score,
+            observations=observations,
+            suggested_mitigation=suggested_mitigation,
+        )
+    )
+    return mock
+
+
+def make_failing_local_analyser() -> AsyncMock:
+    """Return a mock LocalLLMAnalyser whose analyse() always raises."""
+    mock = AsyncMock()
+    mock.analyse = AsyncMock(side_effect=Exception("LLM unavailable"))
+    return mock
 
 
 @pytest.fixture

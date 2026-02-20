@@ -11,12 +11,14 @@ import pytest
 from anomaly_detection.core.models import Event, TrackerConfig
 from anomaly_detection.demo import run_simulation
 from anomaly_detection.engine import AnomalyTracker
-from ..conftest import make_mock_client
+from ..conftest import make_mock_client, make_mock_local_analyser
 
 
 @pytest.fixture
 def tracker(config: TrackerConfig) -> AnomalyTracker:
-    return AnomalyTracker(anthropic_client=make_mock_client(), config=config)
+    t = AnomalyTracker(config=config)
+    t._llm = make_mock_local_analyser()
+    return t
 
 
 @pytest.mark.asyncio
@@ -38,10 +40,10 @@ class TestRunSimulation:
 
 @pytest.mark.asyncio
 async def test_main_runs_with_mocked_client():
-    """Run main() with mocked API key and Anthropic client for coverage."""
+    """Run main() in cloud mode with a mocked Anthropic client for coverage."""
     from anomaly_detection.demo.simulator import main
 
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key", "USE_CLOUD_LLM": "true"}):
         with patch(
             "anomaly_detection.demo.simulator.anthropic.AsyncAnthropic",
             return_value=make_mock_client(),

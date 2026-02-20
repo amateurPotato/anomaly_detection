@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
 from typing import List
 from unittest.mock import AsyncMock
 
@@ -18,7 +17,7 @@ import pytest
 
 from anomaly_detection.core.models import AnomalyReport, Event, TrackerConfig
 from anomaly_detection.engine import AnomalyTracker
-from ..conftest import make_mock_client
+from ..conftest import make_failing_local_analyser, make_mock_local_analyser
 
 
 # ---------------------------------------------------------------------------
@@ -28,20 +27,13 @@ from ..conftest import make_mock_client
 
 def make_tracker(
     config: TrackerConfig,
-    mock_client: AsyncMock | None = None,
+    mock_llm: AsyncMock | None = None,
     report_callback=None,
 ) -> AnomalyTracker:
-    return AnomalyTracker(
-        anthropic_client=mock_client or make_mock_client(),
-        config=config,
-        report_callback=report_callback,
-    )
-
-
-def failing_client() -> AsyncMock:
-    client = AsyncMock()
-    client.messages.create = AsyncMock(side_effect=Exception("LLM unavailable"))
-    return client
+    """Create an AnomalyTracker with a mock local LLM injected (no real HTTP calls)."""
+    tracker = AnomalyTracker(config=config, report_callback=report_callback)
+    tracker._llm = mock_llm if mock_llm is not None else make_mock_local_analyser()
+    return tracker
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +43,8 @@ def failing_client() -> AsyncMock:
 
 @pytest.mark.asyncio
 class TestSlidingWindowEviction:
-    async def test_old_entries_evicted(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    async def test_old_entries_evicted(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         now = time.time()
         old = Event(source_ip="10.0.0.1", endpoint="/old", payload_size=10, timestamp=now - 70)
         new = Event(source_ip="10.0.0.1", endpoint="/new", payload_size=10, timestamp=now)
@@ -63,8 +55,8 @@ class TestSlidingWindowEviction:
         assert len(window) == 1
         assert window[0][1] == "/new"
 
-    async def test_recent_entries_retained(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    async def test_recent_entries_retained(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         now = time.time()
         for i in range(3):
             await tracker.ingest_event(
@@ -73,8 +65,8 @@ class TestSlidingWindowEviction:
             )
         assert len(tracker._windows["10.0.0.2"]) == 3
 
-    async def test_new_ip_starts_empty(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    async def test_new_ip_starts_empty(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         assert "172.16.0.1" not in tracker._windows
 
 
@@ -85,8 +77,8 @@ class TestSlidingWindowEviction:
 
 @pytest.mark.asyncio
 class TestMicroBatchDeduplication:
-    async def test_same_ip_replaced_in_pending(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    async def test_same_ip_replaced_in_pending(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         now = time.time()
         for i in range(4):   # first breach
             await tracker.ingest_event(
@@ -111,27 +103,27 @@ class TestMicroBatchDeduplication:
 
 
 class TestCleanupStaleWindows:
-    def test_stale_ip_removed(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    def test_stale_ip_removed(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         old_ts = time.time() - (config.stale_window_seconds + 10)
         tracker._windows["1.2.3.4"].append((old_ts, "/old", 100))
         tracker._cleanup_stale_windows()
         assert "1.2.3.4" not in tracker._windows
 
-    def test_active_ip_retained(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    def test_active_ip_retained(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         tracker._windows["5.6.7.8"].append((time.time() - 10, "/recent", 100))
         tracker._cleanup_stale_windows()
         assert "5.6.7.8" in tracker._windows
 
-    def test_empty_window_removed(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    def test_empty_window_removed(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         _ = tracker._windows["9.9.9.9"]   # creates empty deque via defaultdict
         tracker._cleanup_stale_windows()
         assert "9.9.9.9" not in tracker._windows
 
-    def test_mixed_ips_only_stale_removed(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    def test_mixed_ips_only_stale_removed(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         now = time.time()
         tracker._windows["stale.ip"].append((now - (config.stale_window_seconds + 1), "/x", 10))
         tracker._windows["active.ip"].append((now - 5, "/y", 10))
@@ -142,9 +134,9 @@ class TestCleanupStaleWindows:
 
 @pytest.mark.asyncio
 class TestCleanupStaleWindowsIntegration:
-    async def test_cleanup_called_by_flush_loop(self, mock_client: AsyncMock):
+    async def test_cleanup_called_by_flush_loop(self):
         cfg = TrackerConfig(micro_batch_seconds=0.1, stale_window_seconds=0)
-        tracker = make_tracker(cfg, mock_client)
+        tracker = make_tracker(cfg)
         tracker._windows["2.2.2.2"].append((time.time() - 1, "/gone", 10))
 
         await tracker.start()
@@ -164,36 +156,36 @@ class TestCircuitBreakerIntegration:
     async def test_failure_increments_circuit_breaker(
         self, config: TrackerConfig, sample_context
     ):
-        tracker = make_tracker(config, failing_client())
+        tracker = make_tracker(config, mock_llm=make_failing_local_analyser())
         await tracker._analyze_and_emit(sample_context, "batch-1")
         assert tracker._circuit_breaker.consecutive_failures == 1
 
     async def test_success_resets_circuit_breaker(
-        self, config: TrackerConfig, mock_client: AsyncMock, sample_context
+        self, config: TrackerConfig, sample_context
     ):
-        tracker = make_tracker(config, mock_client)
+        tracker = make_tracker(config)
         tracker._circuit_breaker._consecutive_failures = 2
         await tracker._analyze_and_emit(sample_context, "batch-1")
         assert tracker._circuit_breaker.consecutive_failures == 0
 
     async def test_circuit_opens_after_threshold(self, config: TrackerConfig, sample_context):
-        tracker = make_tracker(config, failing_client())
+        tracker = make_tracker(config, mock_llm=make_failing_local_analyser())
         for i in range(config.circuit_breaker_threshold):
             await tracker._analyze_and_emit(sample_context, f"b-{i}")
         assert tracker._circuit_breaker.open_at is not None
 
     async def test_open_circuit_skips_llm(self, config: TrackerConfig, sample_context):
-        fc = failing_client()
-        tracker = make_tracker(config, fc)
+        mock_llm = make_failing_local_analyser()
+        tracker = make_tracker(config, mock_llm=mock_llm)
         tracker._circuit_breaker._open_at = time.time()
         tracker._circuit_breaker._consecutive_failures = config.circuit_breaker_threshold
         await tracker._analyze_and_emit(sample_context, "skip")
-        fc.messages.create.assert_not_called()
+        mock_llm.analyse.assert_not_called()
 
     async def test_symbolic_rules_fire_while_circuit_open(
-        self, config: TrackerConfig, sample_context
+        self, config: TrackerConfig
     ):
-        tracker = make_tracker(config, failing_client())
+        tracker = make_tracker(config, mock_llm=make_failing_local_analyser())
         tracker._circuit_breaker._open_at = time.time()
         tracker._circuit_breaker._consecutive_failures = config.circuit_breaker_threshold
 
@@ -216,15 +208,15 @@ class TestCircuitBreakerIntegration:
 
 @pytest.mark.asyncio
 class TestLifecycle:
-    async def test_stop_without_start_is_safe(self, config: TrackerConfig, mock_client: AsyncMock):
+    async def test_stop_without_start_is_safe(self, config: TrackerConfig):
         """stop() without start() does not raise; _flush_task is None."""
-        tracker = make_tracker(config, mock_client)
+        tracker = make_tracker(config)
         await tracker.stop()
         assert tracker._running is False
         assert tracker._flush_task is None
 
-    async def test_start_and_stop(self, config: TrackerConfig, mock_client: AsyncMock):
-        tracker = make_tracker(config, mock_client)
+    async def test_start_and_stop(self, config: TrackerConfig):
+        tracker = make_tracker(config)
         await tracker.start()
         assert tracker._running is True
         assert tracker._flush_task is not None
@@ -271,7 +263,7 @@ class TestLifecycle:
         assert received == []
 
     async def test_llm_error_does_not_crash_engine(self, config: TrackerConfig):
-        tracker = make_tracker(config, failing_client())
+        tracker = make_tracker(config, mock_llm=make_failing_local_analyser())
         await tracker.start()
         now = time.time()
         for i in range(4):

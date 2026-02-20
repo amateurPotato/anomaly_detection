@@ -95,3 +95,8 @@ class TrackerConfig(BaseModel):
     stale_window_seconds: int = 300  # 5 minutes
     circuit_breaker_threshold: int = 5   # consecutive failures before opening
     circuit_breaker_cooldown_seconds: float = 60.0  # seconds to stay open
+
+    # Hybrid LLM: False = local Ollama (default), True = cloud Anthropic
+    use_cloud_llm: bool = False
+    ollama_model: str = "llama3.2"
+    ollama_base_url: str = "http://localhost:11434"
