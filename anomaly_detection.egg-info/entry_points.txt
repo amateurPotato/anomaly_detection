@@ -1,0 +1,2 @@
+[console_scripts]
+anomaly-demo = anomaly_detection.demo.simulator:run_main
